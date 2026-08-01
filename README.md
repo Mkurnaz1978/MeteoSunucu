@@ -41,4 +41,23 @@ npm run build
 npm start
 ```
 
+AIRGRAM endpoint'i (`GET /meteo/airgram`) icin sunucuda Python bagimliliklari gerekli:
+
+```bash
+sudo apt-get install -y python3 python3-matplotlib python3-numpy
+```
+
+Gerekiyorsa Python binary yolunu override edebilirsiniz:
+
+```bash
+export AIRGRAM_PYTHON_BIN=/usr/bin/python3
+```
+
+Open-Meteo rate-limit durumunda raster prewarm'i varsayilan kapali birakabilirsiniz
+(yeni varsayilan zaten kapali). Acmak icin:
+
+```bash
+export ENABLE_RASTER_PREWARM=true
+```
+
 Ubuntu kurulumu için [deploy/install-ubuntu.sh](deploy/install-ubuntu.sh) dosyasını kullanın.

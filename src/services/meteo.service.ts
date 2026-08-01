@@ -1,3 +1,6 @@
+import { spawn } from 'child_process';
+import fs from 'fs';
+import path from 'path';
 import axios from 'axios';
 import { parse } from 'node-html-parser';
 import { PNG } from 'pngjs';
@@ -61,6 +64,7 @@ const FLIGHT_RISK_REQUIRED_FIELDS = [
   'precipitation',
   'cloud_base',
 ] as const;
+const KNOTS_TO_KMH = 1.852;
 
 export class HttpError extends Error {
   constructor(public status: number, message: string) {
@@ -77,11 +81,22 @@ export class MeteoService {
   private readonly surfaceProfileCache = new Map<string, CachedEntry<Record<string, unknown>>>();
   private readonly aloftProfileCache = new Map<string, CachedEntry<Record<string, unknown>>>();
   private readonly routeSampleCache = new Map<string, CachedEntry<RouteSamplePayload>>();
+  private readonly airgramCache = new Map<string, CachedEntry<Buffer>>();
   private mapSnapshotCache?: MeteoMapSnapshotPayload;
   private readonly rasterGridInFlight = new Map<string, Promise<MeteoRasterGridPayload>>();
   private readonly rasterGridByHour = new Map<string, MeteoRasterGridPayload>();
   private readonly enhancedFieldCache = new Map<string, EnhancedRasterField>();
   private latestRasterHour?: string;
+  private readonly tileCache = new Map<string, Buffer>();
+  private static readonly TILE_CACHE_MAX = 6000;
+  private emptyTilePngBuffer: Buffer | null = null;
+  private turboColorLut: Array<[number, number, number]> | null = null;
+  private rasterWarmTimer?: NodeJS.Timeout;
+  // Uygulamadaki "saat animasyonu" secenekleriyle ayni (map_page.dart
+  // dropdown'u): bu ofsetleri arka planda onceden isitarak, kullanici
+  // ileri bir saat sectiginde Open-Meteo'ya canli/agir bir cok-noktali
+  // istek beklemek zorunda kalmiyor.
+  private static readonly RASTER_WARM_OFFSET_HOURS = [0, 1, 2, 3, 4, 5, 6, 12, 24];
 
   start(): void {
     void this.refreshAllStations();
@@ -96,6 +111,35 @@ export class MeteoService {
       void this.refreshAllAviation();
     }, config.aviationRefreshMs);
     this.aviationTimer.unref?.();
+
+    if (process.env.ENABLE_RASTER_PREWARM === 'true') {
+      this.rasterWarmTimer = setInterval(() => {
+        void this.prewarmRasterGrids();
+      }, 20 * 60 * 1000);
+      this.rasterWarmTimer.unref?.();
+    }
+  }
+
+  // Open-Meteo'nun cok-noktali istekleri agir/rate-limitli sayabildigi
+  // gozlemlendiginden, offsetleri seri (paralel degil) ve aralarinda kisa
+  // bir bekleme ile isitiyoruz; tek bir offset basarisiz olsa da digerlerini
+  // engellemez.
+  private async prewarmRasterGrids(): Promise<void> {
+    const base = this.roundedUtcHourNow();
+    for (const offsetHours of MeteoService.RASTER_WARM_OFFSET_HOURS) {
+      const hourIso = new Date(base.getTime() + offsetHours * 60 * 60 * 1000).toISOString();
+      try {
+        await this.refreshRasterGrid(hourIso);
+      } catch (error) {
+        console.warn(`Raster grid on-isitma basarisiz (+${offsetHours}h):`, error instanceof Error ? error.message : error);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+    }
+  }
+
+  private roundedUtcHourNow(): Date {
+    const now = new Date();
+    return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), now.getUTCHours()));
   }
 
   stop(): void {
@@ -106,6 +150,10 @@ export class MeteoService {
     if (this.aviationTimer) {
       clearInterval(this.aviationTimer);
       this.aviationTimer = undefined;
+    }
+    if (this.rasterWarmTimer) {
+      clearInterval(this.rasterWarmTimer);
+      this.rasterWarmTimer = undefined;
     }
   }
 
@@ -368,6 +416,16 @@ export class MeteoService {
         return { min: 0, max: 20 };
       case LOW_CLOUD_LAYER_ID:
         return { min: 0, max: 100 };
+      case 'om_wind_speed':
+      case 'om_wind_gust':
+        // Sabit renklendirme: 0-30 knot (alan verisi km/h olarak tutuluyor).
+        return { min: 0, max: 30 * KNOTS_TO_KMH };
+      case 'om_temperature':
+        // Sabit renklendirme: -10C ile 40C arasi.
+        return { min: -10, max: 40 };
+      case 'om_precipitation':
+        // Sabit renklendirme: 0-20 mm/saat (hafiften siddetli yagmura kadar).
+        return { min: 0, max: 20 };
       default:
         return null;
     }
@@ -452,17 +510,22 @@ export class MeteoService {
   }
 
   async refreshAllStations(): Promise<void> {
-    await Promise.allSettled(
-      STATIONS.flatMap((station) => [
-        this.refreshStation(station.code),
-        this.refreshForecastStation(station.code),
-      ]),
-    );
+    for (const station of STATIONS) {
+      await this.refreshStation(station.code).catch(() => null);
+      await this.refreshForecastStation(station.code).catch(() => null);
+      // Open-Meteo 429 riskini azaltmak icin istekleri yavaslat.
+      await this.delay(250);
+    }
+
     await Promise.allSettled([this.refreshMapSnapshot(), this.refreshRasterGrid()]);
   }
 
   async refreshAllAviation(): Promise<void> {
     await Promise.allSettled(STATIONS.map((station) => this.refreshAviationWeather(station.code)));
+  }
+
+  private delay(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
   async refreshStation(stationCode: string): Promise<MeteoCurrentPayload> {
@@ -472,7 +535,9 @@ export class MeteoService {
       `?latitude=${station.lat}` +
       `&longitude=${station.lon}` +
       '&current=temperature_2m,wind_speed_10m,wind_direction_10m,wind_gusts_10m,visibility,cloud_cover,cloud_cover_low,cloud_base,weather_code,surface_pressure,dew_point_2m,relative_humidity_2m,precipitation' +
-      '&timezone=Europe%2FIstanbul';
+      '&daily=sunrise,sunset,daylight_duration' +
+      '&timezone=UTC' +
+      '&forecast_days=1';
 
     try {
       const response = await axios.get(url, { timeout: 15000 });
@@ -483,6 +548,8 @@ export class MeteoService {
         updatedAt: new Date().toISOString(),
         current: data.current ?? {},
         currentUnits: data.current_units ?? null,
+        daily: data.daily ?? null,
+        dailyUnits: data.daily_units ?? null,
         forecast: await this.getCachedForecastByStation(station.code),
         elevation: this.parseNumeric(data.elevation),
         latitude: this.parseNumeric(data.latitude) ?? undefined,
@@ -494,7 +561,7 @@ export class MeteoService {
     } catch (error) {
       const cached = this.currentCache.get(station.code);
       if (cached) return cached;
-      throw new HttpError(503, `Open-Meteo current verisi alinamadi: ${station.code}`);
+      throw this.toOpenMeteoHttpError(error, `Open-Meteo current verisi alinamadi: ${station.code}`);
     }
   }
 
@@ -535,7 +602,7 @@ export class MeteoService {
     } catch (error) {
       const cached = this.forecastCache.get(station.code);
       if (cached) return cached;
-      throw new HttpError(503, `Open-Meteo forecast verisi alinamadi: ${station.code}`);
+      throw this.toOpenMeteoHttpError(error, `Open-Meteo forecast verisi alinamadi: ${station.code}`);
     }
   }
 
@@ -841,6 +908,264 @@ export class MeteoService {
     return payload;
   }
 
+  // -----------------------------------------------------------------------
+  // AIRGRAM – server-side PNG generation via Python/matplotlib
+  // -----------------------------------------------------------------------
+
+  async getAirgram(stationCode: string): Promise<Buffer> {
+    const station = this.ensureStation(stationCode);
+    const AIRGRAM_TTL_MS = 60 * 60 * 1000; // 1 hour
+
+    const cached = this.airgramCache.get(station.code);
+    if (cached && this.isFresh(cached.updatedAt, AIRGRAM_TTL_MS)) {
+      return cached.data;
+    }
+
+    const inputData = await this.fetchAirgramInputData(station);
+    const png = await this.runAirgramGenerator(inputData);
+
+    this.airgramCache.set(station.code, {
+      updatedAt: new Date().toISOString(),
+      data: png,
+    });
+
+    return png;
+  }
+
+  private async fetchAirgramInputData(station: MeteoStation): Promise<object> {
+    const surfaceFields = [
+      'temperature_2m',
+      'dew_point_2m',
+      'wind_speed_10m',
+      'wind_direction_10m',
+      'surface_pressure',
+      'precipitation',
+      'cloud_cover',
+    ].join(',');
+
+    const aloftFields = [
+      'temperature_925hPa', 'temperature_850hPa', 'temperature_700hPa',
+      'temperature_500hPa', 'temperature_400hPa', 'temperature_300hPa',
+      'wind_speed_925hPa',  'wind_speed_850hPa',  'wind_speed_700hPa',
+      'wind_speed_500hPa',  'wind_speed_400hPa',  'wind_speed_300hPa',
+      'wind_direction_925hPa', 'wind_direction_850hPa', 'wind_direction_700hPa',
+      'wind_direction_500hPa', 'wind_direction_400hPa', 'wind_direction_300hPa',
+    ].join(',');
+
+    const cachedForecast = await this.getCachedForecastByStation(station.code);
+    const cachedHourly = (cachedForecast?.hourly ?? null) as Record<string, unknown> | null;
+    if (cachedHourly && this.hasRequiredAirgramHourlyFields(cachedHourly)) {
+      return this.buildAirgramInputFromHourly(station, cachedHourly);
+    }
+
+    const url =
+      'https://api.open-meteo.com/v1/forecast' +
+      `?latitude=${station.lat}` +
+      `&longitude=${station.lon}` +
+      `&hourly=${surfaceFields},${aloftFields}` +
+      '&forecast_hours=72' +
+      '&wind_speed_unit=kn' +
+      '&timezone=Europe%2FIstanbul';
+
+    try {
+      const response = await axios.get<Record<string, unknown>>(url, { timeout: 30000 });
+      const h = (response.data?.hourly ?? {}) as Record<string, unknown>;
+      return this.buildAirgramInputFromHourly(station, h);
+    } catch (error) {
+      throw this.toOpenMeteoHttpError(error, 'Airgram verisi alinamadi');
+    }
+  }
+
+  private hasRequiredAirgramHourlyFields(hourly: Record<string, unknown>): boolean {
+    const requiredFields = [
+      'time',
+      'temperature_2m',
+      'dew_point_2m',
+      'wind_speed_10m',
+      'wind_direction_10m',
+      'surface_pressure',
+      'precipitation',
+      'cloud_cover',
+      'temperature_925hPa',
+      'temperature_850hPa',
+      'temperature_700hPa',
+      'temperature_500hPa',
+      'temperature_400hPa',
+      'temperature_300hPa',
+      'wind_speed_925hPa',
+      'wind_speed_850hPa',
+      'wind_speed_700hPa',
+      'wind_speed_500hPa',
+      'wind_speed_400hPa',
+      'wind_speed_300hPa',
+      'wind_direction_925hPa',
+      'wind_direction_850hPa',
+      'wind_direction_700hPa',
+      'wind_direction_500hPa',
+      'wind_direction_400hPa',
+      'wind_direction_300hPa',
+    ];
+
+    return requiredFields.every((field) => Array.isArray(hourly[field]));
+  }
+
+  private buildAirgramInputFromHourly(station: MeteoStation, h: Record<string, unknown>): object {
+    return {
+      station: station.code,
+      name: station.name,
+      lat: station.lat,
+      lon: station.lon,
+      surface: {
+        time: h.time ?? [],
+        temperature_2m: h.temperature_2m ?? [],
+        dew_point_2m: h.dew_point_2m ?? [],
+        wind_speed_10m: h.wind_speed_10m ?? [],
+        wind_direction_10m: h.wind_direction_10m ?? [],
+        surface_pressure: h.surface_pressure ?? [],
+        precipitation: h.precipitation ?? [],
+        cloud_cover: h.cloud_cover ?? [],
+      },
+      aloft: {
+        temperature_925hPa: h.temperature_925hPa ?? [],
+        temperature_850hPa: h.temperature_850hPa ?? [],
+        temperature_700hPa: h.temperature_700hPa ?? [],
+        temperature_500hPa: h.temperature_500hPa ?? [],
+        temperature_400hPa: h.temperature_400hPa ?? [],
+        temperature_300hPa: h.temperature_300hPa ?? [],
+        wind_speed_925hPa: h.wind_speed_925hPa ?? [],
+        wind_speed_850hPa: h.wind_speed_850hPa ?? [],
+        wind_speed_700hPa: h.wind_speed_700hPa ?? [],
+        wind_speed_500hPa: h.wind_speed_500hPa ?? [],
+        wind_speed_400hPa: h.wind_speed_400hPa ?? [],
+        wind_speed_300hPa: h.wind_speed_300hPa ?? [],
+        wind_direction_925hPa: h.wind_direction_925hPa ?? [],
+        wind_direction_850hPa: h.wind_direction_850hPa ?? [],
+        wind_direction_700hPa: h.wind_direction_700hPa ?? [],
+        wind_direction_500hPa: h.wind_direction_500hPa ?? [],
+        wind_direction_400hPa: h.wind_direction_400hPa ?? [],
+        wind_direction_300hPa: h.wind_direction_300hPa ?? [],
+      },
+    };
+  }
+
+  private runAirgramGenerator(inputData: object): Promise<Buffer> {
+    return new Promise<Buffer>((resolve, reject) => {
+      const scriptPath = this.resolveAirgramScriptPath();
+      const pythonBins = this.getAirgramPythonCandidates();
+
+      const spawnWithCandidate = (index: number): void => {
+        if (index >= pythonBins.length) {
+          reject(
+            new HttpError(
+              503,
+              'Airgram: python calistirilamadi. Python3 ve matplotlib kurulu olmali (ornek: sudo apt-get install -y python3 python3-matplotlib python3-numpy).',
+            ),
+          );
+          return;
+        }
+
+        const pythonBin = pythonBins[index];
+        const py = spawn(pythonBin, [scriptPath], {
+          timeout: 90_000,
+          stdio: ['pipe', 'pipe', 'pipe'],
+        });
+
+        const chunks: Buffer[] = [];
+        const errChunks: Buffer[] = [];
+
+        py.stdout.on('data', (chunk: Buffer) => chunks.push(chunk));
+        py.stderr.on('data', (chunk: Buffer) => errChunks.push(chunk));
+
+        py.on('error', (err: NodeJS.ErrnoException) => {
+          if (err.code === 'ENOENT') {
+            spawnWithCandidate(index + 1);
+            return;
+          }
+          reject(new HttpError(503, `Airgram: ${pythonBin} calistirilamadi: ${err.message}`));
+        });
+
+        py.on('close', (code: number | null) => {
+          const stderr = Buffer.concat(errChunks).toString('utf8').trim();
+          if (stderr) console.warn(`[airgram_gen.py][${pythonBin}]`, stderr);
+
+          if ((code !== 0 && code !== null) || chunks.length === 0) {
+            if (/No module named .*matplotlib/i.test(stderr)) {
+              reject(
+                new HttpError(
+                  503,
+                  'Airgram: matplotlib kurulu degil. Kurulum: sudo apt-get install -y python3-matplotlib python3-numpy',
+                ),
+              );
+              return;
+            }
+            reject(
+              new HttpError(
+                503,
+                `Airgram: ${pythonBin} hata kodu ${code}. ${stderr.slice(0, 220)}`,
+              ),
+            );
+            return;
+          }
+
+          resolve(Buffer.concat(chunks));
+        });
+
+        try {
+          py.stdin.write(JSON.stringify(inputData), 'utf8');
+          py.stdin.end();
+        } catch (writeErr) {
+          reject(writeErr);
+        }
+      };
+
+      spawnWithCandidate(0);
+    });
+  }
+
+  private resolveAirgramScriptPath(): string {
+    const candidates = [
+      path.join(__dirname, '..', 'airgram_gen.py'),
+      path.join(__dirname, '..', '..', 'src', 'airgram_gen.py'),
+    ];
+
+    for (const candidate of candidates) {
+      if (fs.existsSync(candidate)) return candidate;
+    }
+
+    throw new HttpError(
+      503,
+      `Airgram: airgram_gen.py bulunamadi. Beklenen yollar: ${candidates.join(', ')}`,
+    );
+  }
+
+  private getAirgramPythonCandidates(): string[] {
+    const envBin = process.env.AIRGRAM_PYTHON_BIN?.trim();
+    const values = [envBin, 'python3', 'python'];
+    return Array.from(new Set(values.filter((value): value is string => Boolean(value && value.length > 0))));
+  }
+
+  private toOpenMeteoHttpError(error: unknown, fallbackMessage: string): HttpError {
+    if (axios.isAxiosError(error)) {
+      const status = error.response?.status;
+      const data = error.response?.data as { reason?: string } | undefined;
+      const reason = typeof data?.reason === 'string' ? data.reason : undefined;
+
+      if (status === 429) {
+        return new HttpError(
+          429,
+          reason ??
+            'Open-Meteo kota limiti asildi. Gunluk limit sifirlandiginda tekrar deneyin veya API anahtariyla customer endpoint kullanin.',
+        );
+      }
+
+      if (reason && reason.trim().length > 0) {
+        return new HttpError(503, `${fallbackMessage}: ${reason}`);
+      }
+    }
+
+    return new HttpError(503, fallbackMessage);
+  }
+
   async getMapSnapshot(forceRefresh = false, atIso?: string): Promise<MeteoMapSnapshotPayload> {
     if (atIso && atIso.trim().length > 0) {
       return this.buildTemporalMapSnapshot(atIso);
@@ -967,13 +1292,17 @@ export class MeteoService {
         latitude: latList.join(','),
         longitude: lonList.join(','),
         hourly: requestFields.join(','),
-        forecast_hours: '1',
         timezone: 'UTC',
       });
 
       if (hour) {
-        params.set('start_hour', targetHourIso);
-        params.set('end_hour', targetHourIso);
+        // Open-Meteo start_hour/end_hour expects 'YYYY-MM-DDTHH:mm' (no seconds/millis/Z);
+        // a full ISO string is rejected with "Invalid date format".
+        const hourParam = targetHourIso.slice(0, 16);
+        params.set('start_hour', hourParam);
+        params.set('end_hour', hourParam);
+      } else {
+        params.set('forecast_hours', '1');
       }
 
       const url = `https://api.open-meteo.com/v1/forecast?${params.toString()}`;
@@ -1428,7 +1757,7 @@ export class MeteoService {
     return this.clamp01((s - s0) / (s1 - s0));
   }
 
-  private turboColor(value01: number): [number, number, number] {
+  private computeTurboColor(value01: number): [number, number, number] {
     const x = this.clamp01(value01);
     const x2 = x * x;
     const x3 = x2 * x;
@@ -1444,6 +1773,21 @@ export class MeteoService {
       Math.round(this.clamp01(g) * 255),
       Math.round(this.clamp01(b) * 255),
     ];
+  }
+
+  // Turbo renk paleti sabit bir gradyan olduğundan, polinomu piksel başına
+  // yeniden hesaplamak yerine bir kez 256 girişlik tabloya çözüp indeksliyoruz.
+  private turboColor(value01: number): [number, number, number] {
+    if (!this.turboColorLut) {
+      const size = 256;
+      const lut = new Array<[number, number, number]>(size);
+      for (let i = 0; i < size; i += 1) {
+        lut[i] = this.computeTurboColor(i / (size - 1));
+      }
+      this.turboColorLut = lut;
+    }
+    const idx = Math.round(this.clamp01(value01) * (this.turboColorLut.length - 1));
+    return this.turboColorLut[idx];
   }
 
   private layerEnhancementParams(layerId: string): {
@@ -1761,6 +2105,18 @@ export class MeteoService {
       if (layerId === LOW_CLOUD_LAYER_ID) return lowCloud;
       return this.scoreFlightSuitability(risk, lowCloud);
     }
+
+    // Ruzgar/sicaklik/yagis: dinamik percentile+CLAHE zenginlestirmesi yerine
+    // sabit fiziksel araliga gore dogrudan orantilanmis renklendirme.
+    const fixedScale = this.fixedScaleForLayer(layerId);
+    if (fixedScale) {
+      const raw = this.sampleTemporalValue(field, latitude, longitude, context);
+      if (raw == null || !Number.isFinite(raw)) return null;
+      const span = fixedScale.max - fixedScale.min;
+      if (span <= 0) return null;
+      return this.clamp01((raw - fixedScale.min) / span);
+    }
+
     const enhancedA = this.getEnhancedField(context.gridA, layerId, field);
     const a = this.bilinearSampleEnhancedField(enhancedA, latitude, longitude, context.gridA.stepDegrees);
     if (!context.gridB || context.blend <= 0.001) return a;
@@ -1770,20 +2126,30 @@ export class MeteoService {
     return this.blendValues(a, b, context.blend);
   }
 
+  private emptyTilePng(): Buffer {
+    if (!this.emptyTilePngBuffer) {
+      const empty = new PNG({ width: RASTER_TILE_SIZE, height: RASTER_TILE_SIZE });
+      this.emptyTilePngBuffer = PNG.sync.write(empty);
+    }
+    return this.emptyTilePngBuffer;
+  }
+
+  private cacheTileBuffer(cacheKey: string, buffer: Buffer): void {
+    this.tileCache.set(cacheKey, buffer);
+    if (this.tileCache.size > MeteoService.TILE_CACHE_MAX) {
+      const oldestKey = this.tileCache.keys().next().value;
+      if (oldestKey) this.tileCache.delete(oldestKey);
+    }
+  }
+
   async getRasterTile(layerId: string, z: number, x: number, y: number, atIso?: string): Promise<Buffer> {
     const layer = METEO_MAP_LAYERS.find((entry) => entry.id === layerId);
     if (!layer) {
       throw new HttpError(400, `Gecersiz katman: ${layerId}`);
     }
 
-    let temporalContext: Awaited<ReturnType<MeteoService['resolveTemporalContext']>>;
-    try {
-      temporalContext = await this.resolveTemporalContext(atIso);
-    } catch {
-      const empty = new PNG({ width: RASTER_TILE_SIZE, height: RASTER_TILE_SIZE });
-      return PNG.sync.write(empty);
-    }
-
+    // Tile, veri bbox'inin tamamen disindaysa zaman dilimini cozmeye/aga
+    // gitmeye bile gerek yok - sabit bos tile'i hemen don.
     const westTile = this.tileLon(x, z);
     const eastTile = this.tileLon(x + 1, z);
     const northTile = this.tileLat(y, z);
@@ -1795,13 +2161,28 @@ export class MeteoService {
       northTile < RASTER_BBOX.south ||
       southTile > RASTER_BBOX.north
     ) {
-      const empty = new PNG({ width: RASTER_TILE_SIZE, height: RASTER_TILE_SIZE });
-      return PNG.sync.write(empty);
+      return this.emptyTilePng();
     }
+
+    let temporalContext: Awaited<ReturnType<MeteoService['resolveTemporalContext']>>;
+    try {
+      temporalContext = await this.resolveTemporalContext(atIso);
+    } catch {
+      return this.emptyTilePng();
+    }
+
+    // Ayni katman/saat/tile daha once render edildiyse (pan/zoom tekrari,
+    // birden fazla istemci ayni bolgeyi izliyor vb.) piksel piksel yeniden
+    // hesaplamak yerine onbellekten don.
+    const blendBucket = Math.round(temporalContext.blend * 20);
+    const cacheKey = `${layerId}:${z}:${x}:${y}:${temporalContext.hourIso}:${blendBucket}`;
+    const cached = this.tileCache.get(cacheKey);
+    if (cached) return cached;
 
     const width = RASTER_TILE_SIZE;
     const height = RASTER_TILE_SIZE;
     const png = new PNG({ width, height });
+    const alpha = this.layerEnhancementParams(layerId).alpha;
 
     // Full selected raster extent is enhanced once (per hour/layer) and
     // tiles only sample from that shared enhanced field.
@@ -1835,11 +2216,13 @@ export class MeteoService {
         png.data[pngIdx] = r;
         png.data[pngIdx + 1] = g;
         png.data[pngIdx + 2] = b;
-        png.data[pngIdx + 3] = this.layerEnhancementParams(layerId).alpha;
+        png.data[pngIdx + 3] = alpha;
       }
     }
 
-    return PNG.sync.write(png);
+    const buffer = PNG.sync.write(png);
+    this.cacheTileBuffer(cacheKey, buffer);
+    return buffer;
   }
 
   async getRasterValue(layerId: string, latitude: number, longitude: number, atIso?: string): Promise<MeteoRasterValuePayload> {

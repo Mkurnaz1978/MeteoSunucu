@@ -19,6 +19,7 @@ app.get('/', (_req, res) => {
       '/meteo/current',
       '/meteo/forecast',
       '/meteo/aviation',
+      '/meteo/airgram',
       '/meteo/map/snapshot',
       '/meteo-public/map/tile/:layer/:z/:x/:y.png',
     ],
@@ -88,6 +89,18 @@ app.get('/meteo/route-sample', async (req, res, next) => {
     const longitude = Number(req.query.lon);
     const altitude = String(req.query.altitude ?? 'SFC');
     res.json(await meteoService.getRouteSample(latitude, longitude, altitude));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get('/meteo/airgram', async (req, res, next) => {
+  try {
+    const station = String(req.query.station ?? 'LTFC');
+    const png = await meteoService.getAirgram(station);
+    res.setHeader('Content-Type', 'image/png');
+    res.setHeader('Cache-Control', 'public, max-age=3600');
+    res.send(png);
   } catch (error) {
     next(error);
   }

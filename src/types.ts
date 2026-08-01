@@ -10,6 +10,8 @@ export interface MeteoCurrentPayload {
   updatedAt: string;
   current: Record<string, unknown>;
   currentUnits?: Record<string, unknown> | null;
+  daily?: Record<string, unknown> | null;
+  dailyUnits?: Record<string, unknown> | null;
   forecast?: MeteoForecastPayload | null;
   elevation?: number | null;
   latitude?: number;
