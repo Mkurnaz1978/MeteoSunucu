@@ -5,7 +5,7 @@ APP_DIR=/opt/meteo-sunucu
 SERVICE_NAME=meteo-sunucu
 
 sudo apt-get update
-sudo apt-get install -y curl nginx rsync python3 python3-pip python3-matplotlib python3-numpy
+sudo apt-get install -y curl nginx rsync python3 python3-pip python3-matplotlib python3-numpy gdal-bin
 
 if ! command -v node >/dev/null 2>&1; then
   curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -

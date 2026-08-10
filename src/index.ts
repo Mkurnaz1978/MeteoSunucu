@@ -2,9 +2,11 @@ import cors from 'cors';
 import express, { Request, Response, NextFunction } from 'express';
 import { config } from './config';
 import { HttpError, MeteoService } from './services/meteo.service';
+import { DemService } from './services/dem.service';
 
 const app = express();
 const meteoService = new MeteoService();
+const demService = new DemService();
 
 app.use(cors({ origin: config.allowedOrigin === '*' ? true : config.allowedOrigin }));
 app.use(express.json({ limit: '1mb' }));
@@ -22,12 +24,81 @@ app.get('/', (_req, res) => {
       '/meteo/airgram',
       '/meteo/map/snapshot',
       '/meteo-public/map/tile/:layer/:z/:x/:y.png',
+      '/dem/health',
+      '/dem/elevation',
+      '/dem/elevation/agl-to-msl',
+      '/dem/elevation/batch',
+      '/dem/ground-collision/analyze',
     ],
   });
 });
 
 app.get('/health', (_req, res) => {
   res.json({ status: 'ok', time: new Date().toISOString() });
+});
+
+app.get('/dem/health', async (_req, res, next) => {
+  try {
+    await demService.initialize();
+    res.json({ status: 'ok', ...demService.status() });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get('/dem/elevation', async (req, res, next) => {
+  try {
+    const lat = Number(req.query.lat);
+    const lon = Number(req.query.lon);
+    res.json(await demService.getElevation(lat, lon));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get('/dem/elevation/agl-to-msl', async (req, res, next) => {
+  try {
+    const lat = Number(req.query.lat);
+    const lon = Number(req.query.lon);
+    const aglFt = Number(req.query.aglFt);
+    const roundStepFt = Number(req.query.roundStepFt ?? config.demAglRoundStepFt);
+    res.json(await demService.aglToMslRounded(lat, lon, aglFt, roundStepFt));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post('/dem/elevation/batch', async (req, res, next) => {
+  try {
+    const body = (req.body ?? {}) as {
+      points?: Array<{ lat: number; lon: number; aglFt?: number }>;
+      roundStepFt?: number;
+    };
+    res.json(await demService.getElevationBatch(body.points ?? [], body.roundStepFt));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post('/dem/ground-collision/analyze', async (req, res, next) => {
+  try {
+    const body = (req.body ?? {}) as {
+      routePoints?: Array<{ lat: number; lon: number; aircraftAltitudeFt: number }>;
+      lateralNm?: number;
+      clearanceFt?: number;
+      profileStepNm?: number;
+    };
+    res.json(
+      await demService.analyzeGroundCollision({
+        routePoints: body.routePoints ?? [],
+        lateralNm: body.lateralNm,
+        clearanceFt: body.clearanceFt,
+        profileStepNm: body.profileStepNm,
+      }),
+    );
+  } catch (error) {
+    next(error);
+  }
 });
 
 app.get('/meteo/stations', (_req, res) => {
@@ -170,6 +241,9 @@ app.use((error: unknown, _req: Request, res: Response, _next: NextFunction) => {
 });
 
 const server = app.listen(config.port, config.host, () => {
+  void demService.initialize().catch((error) => {
+    console.warn('DEM baslatma uyarisi:', error instanceof Error ? error.message : String(error));
+  });
   meteoService.start();
   console.log(`MeteoSunucu listening on http://${config.host}:${config.port}`);
 });
