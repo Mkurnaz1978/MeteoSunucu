@@ -230,6 +230,80 @@ app.get('/meteo-public/map/stats', async (req, res, next) => {
   }
 });
 
+app.post('/meteo-public/route-airport-temperature', async (req, res, next) => {
+  try {
+    const body = (req.body ?? {}) as {
+      routePoints?: Array<{ latitude?: number; longitude?: number; atIso?: string }>;
+      departureIcao?: string;
+      arrivalIcao?: string;
+      corridorHalfWidthNm?: number;
+    };
+
+    const routePoints = Array.isArray(body.routePoints) ? body.routePoints : [];
+    const departureIcao = String(body.departureIcao ?? '').trim().toUpperCase();
+    const arrivalIcao = String(body.arrivalIcao ?? '').trim().toUpperCase();
+
+    const routeTemperatures: number[] = [];
+    for (const point of routePoints) {
+      const latitude = Number(point.latitude);
+      const longitude = Number(point.longitude);
+      if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) continue;
+
+      try {
+        const sample = await meteoService.getRouteSample(latitude, longitude, 'SFC');
+        if (Number.isFinite(sample.temperature)) {
+          routeTemperatures.push(sample.temperature);
+        }
+      } catch {
+        // route segment could be invalid or temporarily unavailable; continue
+      }
+    }
+
+    let departureTemperature: number | null = null;
+    if (departureIcao) {
+      try {
+        const current = await meteoService.getCurrentByStation(departureIcao);
+        departureTemperature = Number(current.current?.temperature_2m ?? current.current?.temp ?? current.current?.temperature_2m ?? current.current?.temperature ?? current.current?.temperatureC ?? current.current?.tempC ?? null);
+      } catch {
+        departureTemperature = null;
+      }
+    }
+
+    let arrivalTemperature: number | null = null;
+    if (arrivalIcao) {
+      const normalizedArrivalIcao = arrivalIcao === departureIcao ? departureIcao : arrivalIcao;
+      try {
+        const current = await meteoService.getCurrentByStation(normalizedArrivalIcao);
+        arrivalTemperature = Number(current.current?.temperature_2m ?? current.current?.temp ?? current.current?.temperature_2m ?? current.current?.temperature ?? current.current?.temperatureC ?? current.current?.tempC ?? null);
+
+        if (arrivalIcao === departureIcao && departureTemperature == null) {
+          departureTemperature = arrivalTemperature;
+        }
+      } catch {
+        arrivalTemperature = null;
+      }
+    }
+
+    const routeTemperature = routeTemperatures.length > 0
+      ? routeTemperatures.reduce((sum, value) => sum + value, 0) / routeTemperatures.length
+      : null;
+
+    const values = [routeTemperature, departureTemperature, arrivalTemperature].filter(
+      (value): value is number => value != null && Number.isFinite(value),
+    );
+
+    res.json({
+      routeTemperatureC: routeTemperature,
+      departureTemperatureC: departureTemperature,
+      arrivalTemperatureC: arrivalTemperature,
+      averageC: values.length > 0 ? values.reduce((sum, value) => sum + value, 0) / values.length : null,
+      routePointsCount: routePoints.length,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.use((error: unknown, _req: Request, res: Response, _next: NextFunction) => {
   if (error instanceof HttpError) {
     res.status(error.status).json({ error: true, reason: error.message });
