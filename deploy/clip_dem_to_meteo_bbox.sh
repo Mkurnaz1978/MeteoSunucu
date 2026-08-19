@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Clips DEM GeoTIFF files to MeteoSunucu bbox from src/stations.ts
-# BBOX: west=25.7 south=35.7 east=33.2 north=41.3
+# Clips DEM GeoTIFF files to the route-analysis coverage rectangle.
+# BBOX: Midilli'nin batısı=25.7, Meis'in güneyi=36.0,
+# Konya'nın doğusu=32.7, Bursa'nın kuzeyi=40.4.
 # NOTE: Tek tek dosyalari bbox'a kirpmak her dosyada ayni extenti olusturur.
 # Bu script once mozaik VRT olusturur, sonra tek bir clipped DEM uretir.
 
@@ -10,9 +11,9 @@ SRC_DIR="${1:-/opt/meteo-sunucu/data/dem}"
 OUT_DIR="${2:-/opt/meteo-sunucu/data/dem_clipped}"
 
 WEST="25.7"
-SOUTH="35.7"
-EAST="33.2"
-NORTH="41.3"
+SOUTH="36.0"
+EAST="32.7"
+NORTH="40.4"
 
 if ! command -v gdalwarp >/dev/null 2>&1; then
   echo "gdalwarp bulunamadi. Lutfen once gdal-bin kurun." >&2

@@ -12,6 +12,9 @@ RestartSec=5
 Environment=NODE_ENV=production
 Environment=PORT=3001
 Environment=HOST=0.0.0.0
+Environment=DEM_ENABLED=true
+Environment=DEM_DATA_PATH=/opt/meteo-sunucu/data/dem_clipped
+Environment=DEM_RESTRICT_TO_METEO_BBOX=true
 
 [Install]
 WantedBy=multi-user.target

@@ -216,16 +216,31 @@ export class DemService {
     const profile = this.buildProfilePoints(normalizedPoints, profileStepNm);
     const segmentSamples = this.buildSegmentSamples(normalizedPoints, lateralNm);
 
+    if (!config.demEnabled) {
+      throw new HttpError(503, 'DTED analizi etkin degil (DEM_ENABLED=true gerekli)');
+    }
+    await this.initialize();
+    if (!this.rasters.length) {
+      throw new HttpError(503, this.loadError ?? 'DTED GeoTIFF verisi bulunamadi');
+    }
+
     const samplePoints = profile.map((p) => ({ lat: p.lat, lon: p.lon }));
     const elevationResults = await this.getElevationBatchChunked(samplePoints);
 
     const terrainByKey = new Map<string, number>();
     for (const row of elevationResults) {
-      terrainByKey.set(this.pointKey(row.latitude, row.longitude), row.elevationFeet ?? 0);
+      const elevationFeet = row.elevationFeet;
+      if (!row.source.startsWith('dem:') || typeof elevationFeet !== 'number' || !Number.isFinite(elevationFeet)) {
+        throw new HttpError(422, `DTED kapsami disinda veya eksik: ${row.source}`);
+      }
+      terrainByKey.set(this.pointKey(row.latitude, row.longitude), elevationFeet);
     }
 
     const profileRows: DemGroundCollisionAnalyzeProfilePoint[] = profile.map((p) => {
-      const terrainFt = terrainByKey.get(this.pointKey(p.lat, p.lon)) ?? 0;
+      const terrainFt = terrainByKey.get(this.pointKey(p.lat, p.lon));
+      if (terrainFt == null) {
+        throw new HttpError(422, 'DTED profil noktasi eksik');
+      }
       const clearance = p.aircraftAltitudeFt - terrainFt;
       return {
         distanceNm: p.distanceNm,
